@@ -5,14 +5,19 @@ import (
 	"fmt"
 
 	"github.com/bearsh/hid"
+	"github.com/golang/geo/r3"
+	"go.viam.com/rdk/components/arm"
 	generic "go.viam.com/rdk/components/generic"
 	"go.viam.com/rdk/logging"
 	"go.viam.com/rdk/resource"
+	"go.viam.com/rdk/spatialmath"
 )
 
 const (
 	vendorID  uint16 = 0x2E8A
 	productID uint16 = 0x000A
+
+	defaultMoveMM float64 = 1.0
 )
 
 var PicoDialController = resource.NewModel("viam", "pico-dial-controller", "pico-dial-controller")
@@ -25,40 +30,64 @@ func init() {
 	)
 }
 
-// DialMapping maps a physical encoder index to a Viam component and command.
+// DialMapping maps a physical encoder index to an arm axis.
 type DialMapping struct {
-	Dial      int    `json:"dial"`
-	Component string `json:"component"`
-	Command   string `json:"command"`
+	Dial int    `json:"dial"`
+	Axis string `json:"axis"` // "x", "y", "z", or "orientation"
 }
 
 // Config holds the module configuration.
 type Config struct {
 	// Serial is the USB serial number of the Pico to use.
 	// Omit to connect to the first device found with the matching VID/PID.
-	Serial string        `json:"serial,omitempty"`
-	Dials  []DialMapping `json:"dials"`
+	Serial string `json:"serial,omitempty"`
+
+	ArmName string        `json:"arm_name"`
+	Dials   []DialMapping `json:"dials"`
+
+	DialMoveXMM           float64 `json:"dial_move_x_mm,omitempty"`
+	DialMoveYMM           float64 `json:"dial_move_y_mm,omitempty"`
+	DialMoveZMM           float64 `json:"dial_move_z_mm,omitempty"`
+	DialMoveOrientationMM float64 `json:"dial_move_orientation_mm,omitempty"`
+}
+
+func (cfg *Config) moveMM(axis string) float64 {
+	switch axis {
+	case "x":
+		if cfg.DialMoveXMM > 0 {
+			return cfg.DialMoveXMM
+		}
+	case "y":
+		if cfg.DialMoveYMM > 0 {
+			return cfg.DialMoveYMM
+		}
+	case "z":
+		if cfg.DialMoveZMM > 0 {
+			return cfg.DialMoveZMM
+		}
+	case "orientation":
+		if cfg.DialMoveOrientationMM > 0 {
+			return cfg.DialMoveOrientationMM
+		}
+	}
+	return defaultMoveMM
 }
 
 func (cfg *Config) Validate(path string) ([]string, []string, error) {
+	if cfg.ArmName == "" {
+		return nil, nil, fmt.Errorf("%s: arm_name is required", path)
+	}
 	if len(cfg.Dials) == 0 {
 		return nil, nil, fmt.Errorf("%s: dials must not be empty", path)
 	}
-	seen := map[string]bool{}
-	var deps []string
 	for i, d := range cfg.Dials {
-		if d.Component == "" {
-			return nil, nil, fmt.Errorf("%s: dials[%d] missing component", path, i)
-		}
-		if d.Command == "" {
-			return nil, nil, fmt.Errorf("%s: dials[%d] missing command", path, i)
-		}
-		if !seen[d.Component] {
-			deps = append(deps, d.Component)
-			seen[d.Component] = true
+		switch d.Axis {
+		case "x", "y", "z", "orientation":
+		default:
+			return nil, nil, fmt.Errorf("%s: dials[%d] axis %q must be one of: x, y, z, orientation", path, i, d.Axis)
 		}
 	}
-	return deps, nil, nil
+	return []string{cfg.ArmName}, nil, nil
 }
 
 type picoDialControllerPicoDialController struct {
@@ -69,7 +98,7 @@ type picoDialControllerPicoDialController struct {
 	cfg        *Config
 	cancelCtx  context.Context
 	cancelFunc func()
-	deps       resource.Dependencies
+	myArm      arm.Arm
 	byDial     map[int]DialMapping
 }
 
@@ -84,6 +113,12 @@ func newPicoDialControllerPicoDialController(ctx context.Context, deps resource.
 func NewPicoDialController(ctx context.Context, deps resource.Dependencies, name resource.Name, conf *Config, logger logging.Logger) (resource.Resource, error) {
 	cancelCtx, cancelFunc := context.WithCancel(context.Background())
 
+	myArm, err := arm.FromDependencies(deps, conf.ArmName)
+	if err != nil {
+		cancelFunc()
+		return nil, fmt.Errorf("arm %q not found: %w", conf.ArmName, err)
+	}
+
 	byDial := make(map[int]DialMapping, len(conf.Dials))
 	for _, d := range conf.Dials {
 		byDial[d.Dial] = d
@@ -95,7 +130,7 @@ func NewPicoDialController(ctx context.Context, deps resource.Dependencies, name
 		cfg:        conf,
 		cancelCtx:  cancelCtx,
 		cancelFunc: cancelFunc,
-		deps:       deps,
+		myArm:      myArm,
 		byDial:     byDial,
 	}
 
@@ -136,7 +171,6 @@ func (s *picoDialControllerPicoDialController) readLoop(dev *hid.Device) {
 		default:
 		}
 
-		// 100ms timeout so we can check cancelCtx without blocking indefinitely
 		n, err := dev.ReadTimeout(buf, 100)
 		if err != nil {
 			s.logger.Errorw("HID read error, stopping", "error", err)
@@ -151,27 +185,46 @@ func (s *picoDialControllerPicoDialController) readLoop(dev *hid.Device) {
 
 		mapping, ok := s.byDial[dialIndex]
 		if !ok {
-			continue // encoder not mapped in config
-		}
-
-		compName := resource.NewName(generic.API, mapping.Component)
-		res, ok := s.deps[compName]
-		if !ok {
-			s.logger.Errorw("component not found in dependencies", "component", mapping.Component)
 			continue
 		}
 
-		if _, err := res.DoCommand(s.cancelCtx, map[string]interface{}{
-			"command":   mapping.Command,
-			"direction": direction,
-		}); err != nil {
-			s.logger.Warnw("DoCommand failed",
-				"component", mapping.Component,
-				"command", mapping.Command,
-				"error", err,
-			)
+		if err := s.moveDial(mapping.Axis, direction); err != nil {
+			s.logger.Warnw("arm move failed", "axis", mapping.Axis, "error", err)
 		}
 	}
+}
+
+func (s *picoDialControllerPicoDialController) moveDial(axis string, direction int) error {
+	currentPose, err := s.myArm.EndPosition(s.cancelCtx, nil)
+	if err != nil {
+		return fmt.Errorf("failed to get arm position: %w", err)
+	}
+
+	mm := s.cfg.moveMM(axis) * float64(direction)
+	pt := currentPose.Point()
+	var newPoint r3.Vector
+
+	switch axis {
+	case "x":
+		newPoint = r3.Vector{X: pt.X + mm, Y: pt.Y, Z: pt.Z}
+	case "y":
+		newPoint = r3.Vector{X: pt.X, Y: pt.Y + mm, Z: pt.Z}
+	case "z":
+		newPoint = r3.Vector{X: pt.X, Y: pt.Y, Z: pt.Z + mm}
+	case "orientation":
+		// Move along the tool's current orientation vector
+		ov := currentPose.Orientation().OrientationVectorRadians()
+		newPoint = r3.Vector{
+			X: pt.X + ov.OX*mm,
+			Y: pt.Y + ov.OY*mm,
+			Z: pt.Z + ov.OZ*mm,
+		}
+	default:
+		return fmt.Errorf("unknown axis %q", axis)
+	}
+
+	newPose := spatialmath.NewPose(newPoint, currentPose.Orientation())
+	return s.myArm.MoveToPosition(s.cancelCtx, newPose, nil)
 }
 
 func (s *picoDialControllerPicoDialController) Name() resource.Name {
@@ -181,12 +234,14 @@ func (s *picoDialControllerPicoDialController) Name() resource.Name {
 func (s *picoDialControllerPicoDialController) DoCommand(ctx context.Context, cmd map[string]interface{}) (map[string]interface{}, error) {
 	return map[string]interface{}{
 		"dials_configured": len(s.cfg.Dials),
+		"arm":              s.cfg.ArmName,
 	}, nil
 }
 
 func (s *picoDialControllerPicoDialController) Status(ctx context.Context) (map[string]interface{}, error) {
 	return map[string]interface{}{
 		"dials_configured": len(s.cfg.Dials),
+		"arm":              s.cfg.ArmName,
 	}, nil
 }
 
