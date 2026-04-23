@@ -26,6 +26,7 @@ module.tar.gz: meta.json $(MODULE_BINARY)
 ifneq ($(VIAM_TARGET_OS), windows)
 	strip $(MODULE_BINARY)
 endif
+	chmod +x first_run.sh
 	tar czf $@ meta.json first_run.sh $(MODULE_BINARY)
 
 module: test module.tar.gz
