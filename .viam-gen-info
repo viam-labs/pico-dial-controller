@@ -1,0 +1,13 @@
+{
+  "module_name": "pico-dial-controller",
+  "visibility": "public",
+  "namespace": "viam",
+  "language": "go",
+  "resource_type": "component",
+  "resource_subtype": "generic",
+  "model_name": "pico-dial-controller",
+  "initialize_git": false,
+  "generator_version": "0.1.0",
+  "generated_on": "2026-04-23T16:05:50.012667Z",
+  "module_readme_link": "README.md"
+}
