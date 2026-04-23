@@ -13,6 +13,7 @@ import (
 	"go.viam.com/rdk/logging"
 	"go.viam.com/rdk/resource"
 	"go.viam.com/rdk/spatialmath"
+	"gonum.org/v1/gonum/num/quat"
 )
 
 const (
@@ -51,6 +52,10 @@ type Config struct {
 	DialMoveYMM           float64 `json:"dial_move_y_mm,omitempty"`
 	DialMoveZMM           float64 `json:"dial_move_z_mm,omitempty"`
 	DialMoveOrientationMM float64 `json:"dial_move_orientation_mm,omitempty"`
+
+	DialMoveRXDeg float64 `json:"dial_move_rx_deg,omitempty"`
+	DialMoveRYDeg float64 `json:"dial_move_ry_deg,omitempty"`
+	DialMoveRZDeg float64 `json:"dial_move_rz_deg,omitempty"`
 
 	// Acceleration: movement multiplier grows as dial velocity increases.
 	// multiplier = clamp((velocity / AccelThresholdHz)^AccelExponent, 1, AccelMaxMultiplier)
@@ -102,6 +107,24 @@ func (cfg *Config) moveMM(axis string) float64 {
 	return defaultMoveMM
 }
 
+func (cfg *Config) moveDeg(axis string) float64 {
+	switch axis {
+	case "rx":
+		if cfg.DialMoveRXDeg > 0 {
+			return cfg.DialMoveRXDeg
+		}
+	case "ry":
+		if cfg.DialMoveRYDeg > 0 {
+			return cfg.DialMoveRYDeg
+		}
+	case "rz":
+		if cfg.DialMoveRZDeg > 0 {
+			return cfg.DialMoveRZDeg
+		}
+	}
+	return 1.0
+}
+
 func (cfg *Config) Validate(path string) ([]string, []string, error) {
 	if cfg.ArmName == "" {
 		return nil, nil, fmt.Errorf("%s: arm_name is required", path)
@@ -111,7 +134,7 @@ func (cfg *Config) Validate(path string) ([]string, []string, error) {
 	}
 	for i, d := range cfg.Dials {
 		switch d.Axis {
-		case "x", "y", "z", "orientation":
+		case "x", "y", "z", "orientation", "rx", "ry", "rz":
 		default:
 			return nil, nil, fmt.Errorf("%s: dials[%d] axis %q must be one of: x, y, z, orientation", path, i, d.Axis)
 		}
@@ -258,6 +281,16 @@ func (s *picoDialControllerPicoDialController) moveDial(axis string, direction i
 		return fmt.Errorf("failed to get arm position: %w", err)
 	}
 
+	switch axis {
+	case "rx", "ry", "rz":
+		deg := s.cfg.moveDeg(axis) * float64(direction) * multiplier
+		newPose, err := rotatePose(currentPose, axis, deg)
+		if err != nil {
+			return err
+		}
+		return s.myArm.MoveToPosition(s.cancelCtx, newPose, nil)
+	}
+
 	mm := s.cfg.moveMM(axis) * float64(direction) * multiplier
 	pt := currentPose.Point()
 	var newPoint r3.Vector
@@ -283,6 +316,59 @@ func (s *picoDialControllerPicoDialController) moveDial(axis string, direction i
 
 	newPose := spatialmath.NewPose(newPoint, currentPose.Orientation())
 	return s.myArm.MoveToPosition(s.cancelCtx, newPose, nil)
+}
+
+// rotatePose applies a rotation of deg degrees around the given world axis (rx/ry/rz)
+// to the pose's orientation by left-multiplying the rotation quaternion.
+func rotatePose(pose spatialmath.Pose, axis string, deg float64) (spatialmath.Pose, error) {
+	theta := deg * math.Pi / 180.0
+	half := theta / 2.0
+	cosHalf, sinHalf := math.Cos(half), math.Sin(half)
+
+	var rotQ quat.Number
+	switch axis {
+	case "rx":
+		rotQ = quat.Number{Real: cosHalf, Imag: sinHalf}
+	case "ry":
+		rotQ = quat.Number{Real: cosHalf, Jmag: sinHalf}
+	case "rz":
+		rotQ = quat.Number{Real: cosHalf, Kmag: sinHalf}
+	default:
+		return nil, fmt.Errorf("unknown rotation axis %q", axis)
+	}
+
+	currentQ := pose.Orientation().Quaternion()
+	newQ := quat.Mul(rotQ, quat.Number{
+		Real: currentQ.Real,
+		Imag: currentQ.Imag,
+		Jmag: currentQ.Jmag,
+		Kmag: currentQ.Kmag,
+	})
+
+	// Normalize
+	mag := quat.Abs(newQ)
+	if mag > 1e-10 {
+		newQ = quat.Scale(1.0/mag, newQ)
+	}
+
+	// Convert quaternion to R4AA (axis-angle)
+	w := math.Min(1.0, math.Max(-1.0, newQ.Real))
+	theta2 := 2.0 * math.Acos(w)
+	s := math.Sin(theta2 / 2.0)
+
+	var ori spatialmath.Orientation
+	if s < 1e-10 {
+		ori = &spatialmath.R4AA{Theta: 0, RX: 1}
+	} else {
+		ori = &spatialmath.R4AA{
+			Theta: theta2,
+			RX:    newQ.Imag / s,
+			RY:    newQ.Jmag / s,
+			RZ:    newQ.Kmag / s,
+		}
+	}
+
+	return spatialmath.NewPose(pose.Point(), ori), nil
 }
 
 func (s *picoDialControllerPicoDialController) Name() resource.Name {
