@@ -3,6 +3,8 @@ package picodialcontroller
 import (
 	"context"
 	"fmt"
+	"math"
+	"time"
 
 	"github.com/bearsh/hid"
 	"github.com/golang/geo/r3"
@@ -49,6 +51,33 @@ type Config struct {
 	DialMoveYMM           float64 `json:"dial_move_y_mm,omitempty"`
 	DialMoveZMM           float64 `json:"dial_move_z_mm,omitempty"`
 	DialMoveOrientationMM float64 `json:"dial_move_orientation_mm,omitempty"`
+
+	// Acceleration: movement multiplier grows as dial velocity increases.
+	// multiplier = clamp((velocity / AccelThresholdHz)^AccelExponent, 1, AccelMaxMultiplier)
+	AccelThresholdHz   float64 `json:"accel_threshold_hz,omitempty"`   // detents/sec to start accelerating (default 3)
+	AccelMaxMultiplier float64 `json:"accel_max_multiplier,omitempty"` // max multiplier at high speed (default 10)
+	AccelExponent      float64 `json:"accel_exponent,omitempty"`       // curve shape: 1=linear, 2=quadratic (default 1.5)
+}
+
+func (cfg *Config) accelThresholdHz() float64 {
+	if cfg.AccelThresholdHz > 0 {
+		return cfg.AccelThresholdHz
+	}
+	return 3.0
+}
+
+func (cfg *Config) accelMaxMultiplier() float64 {
+	if cfg.AccelMaxMultiplier > 0 {
+		return cfg.AccelMaxMultiplier
+	}
+	return 10.0
+}
+
+func (cfg *Config) accelExponent() float64 {
+	if cfg.AccelExponent > 0 {
+		return cfg.AccelExponent
+	}
+	return 1.5
 }
 
 func (cfg *Config) moveMM(axis string) float64 {
@@ -98,8 +127,9 @@ type picoDialControllerPicoDialController struct {
 	cfg        *Config
 	cancelCtx  context.Context
 	cancelFunc func()
-	myArm      arm.Arm
-	byDial     map[int]DialMapping
+	myArm         arm.Arm
+	byDial        map[int]DialMapping
+	lastDetentTime map[int]time.Time // per-dial, only accessed from readLoop
 }
 
 func newPicoDialControllerPicoDialController(ctx context.Context, deps resource.Dependencies, rawConf resource.Config, logger logging.Logger) (resource.Resource, error) {
@@ -130,8 +160,9 @@ func NewPicoDialController(ctx context.Context, deps resource.Dependencies, name
 		cfg:        conf,
 		cancelCtx:  cancelCtx,
 		cancelFunc: cancelFunc,
-		myArm:      myArm,
-		byDial:     byDial,
+		myArm:          myArm,
+		byDial:         byDial,
+		lastDetentTime: make(map[int]time.Time),
 	}
 
 	devs := hid.Enumerate(vendorID, productID)
@@ -188,19 +219,46 @@ func (s *picoDialControllerPicoDialController) readLoop(dev *hid.Device) {
 			continue
 		}
 
-		if err := s.moveDial(mapping.Axis, direction); err != nil {
+		multiplier := s.acceleration(dialIndex)
+		if err := s.moveDial(mapping.Axis, direction, multiplier); err != nil {
 			s.logger.Warnw("arm move failed", "axis", mapping.Axis, "error", err)
 		}
 	}
 }
 
-func (s *picoDialControllerPicoDialController) moveDial(axis string, direction int) error {
+// acceleration returns a movement multiplier based on how fast the dial is turning.
+// Only called from readLoop — no locking needed.
+func (s *picoDialControllerPicoDialController) acceleration(dialIndex int) float64 {
+	now := time.Now()
+	last, ok := s.lastDetentTime[dialIndex]
+	s.lastDetentTime[dialIndex] = now
+
+	if !ok {
+		return 1.0 // first event, no velocity yet
+	}
+
+	dt := now.Sub(last).Seconds()
+	if dt <= 0 {
+		return s.cfg.accelMaxMultiplier()
+	}
+
+	velocity := 1.0 / dt
+	threshold := s.cfg.accelThresholdHz()
+	if velocity <= threshold {
+		return 1.0
+	}
+
+	multiplier := math.Pow(velocity/threshold, s.cfg.accelExponent())
+	return math.Min(multiplier, s.cfg.accelMaxMultiplier())
+}
+
+func (s *picoDialControllerPicoDialController) moveDial(axis string, direction int, multiplier float64) error {
 	currentPose, err := s.myArm.EndPosition(s.cancelCtx, nil)
 	if err != nil {
 		return fmt.Errorf("failed to get arm position: %w", err)
 	}
 
-	mm := s.cfg.moveMM(axis) * float64(direction)
+	mm := s.cfg.moveMM(axis) * float64(direction) * multiplier
 	pt := currentPose.Point()
 	var newPoint r3.Vector
 
