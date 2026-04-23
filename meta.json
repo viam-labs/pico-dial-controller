@@ -2,7 +2,7 @@
   "$schema": "https://dl.viam.dev/module.schema.json",
   "module_id": "viam:pico-dial-controller",
   "visibility": "public",
-  "url": "",
+  "url": "https://github.com/viam-labs/pico-dial-controller",
   "description": "Modular generic component: pico-dial-controller",
   "applications": null,
   "markdown_link": "README.md",
