@@ -34,5 +34,5 @@ module: test module.tar.gz
 all: test module.tar.gz
 
 setup:
-	@if [ "$$(uname)" = "Linux" ]; then apt-get update && apt-get install -y libudev-dev; fi
+	@if [ "$$(uname)" = "Linux" ]; then apt-get update && apt-get install -y libudev-dev libusb-1.0-0-dev; fi
 	go mod tidy

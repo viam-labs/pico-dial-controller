@@ -4,7 +4,7 @@ import (
 	"context"
 	"fmt"
 
-	"github.com/sstallion/go-hid"
+	"github.com/bearsh/hid"
 	generic "go.viam.com/rdk/components/generic"
 	"go.viam.com/rdk/logging"
 	"go.viam.com/rdk/resource"
@@ -99,11 +99,26 @@ func NewPicoDialController(ctx context.Context, deps resource.Dependencies, name
 		byDial:     byDial,
 	}
 
-	dev, err := hid.Open(vendorID, productID, conf.Serial)
+	devs := hid.Enumerate(vendorID, productID)
+	if len(devs) == 0 {
+		cancelFunc()
+		return nil, fmt.Errorf("no HID device found (VID=0x%04X PID=0x%04X)", vendorID, productID)
+	}
+	var devInfo *hid.DeviceInfo
+	for i := range devs {
+		if conf.Serial == "" || devs[i].Serial == conf.Serial {
+			devInfo = &devs[i]
+			break
+		}
+	}
+	if devInfo == nil {
+		cancelFunc()
+		return nil, fmt.Errorf("no HID device found with serial %q", conf.Serial)
+	}
+	dev, err := devInfo.Open()
 	if err != nil {
 		cancelFunc()
-		return nil, fmt.Errorf("failed to open HID device (VID=0x%04X PID=0x%04X serial=%q): %w",
-			vendorID, productID, conf.Serial, err)
+		return nil, fmt.Errorf("failed to open HID device: %w", err)
 	}
 
 	go s.readLoop(dev)
@@ -122,7 +137,7 @@ func (s *picoDialControllerPicoDialController) readLoop(dev *hid.Device) {
 		}
 
 		// 100ms timeout so we can check cancelCtx without blocking indefinitely
-		n, err := dev.ReadWithTimeout(buf, 100)
+		n, err := dev.ReadTimeout(buf, 100)
 		if err != nil {
 			s.logger.Errorw("HID read error, stopping", "error", err)
 			return
