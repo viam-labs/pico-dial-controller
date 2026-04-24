@@ -21,6 +21,11 @@ const (
 	productID uint16 = 0x000A
 
 	defaultMoveMM float64 = 1.0
+
+	// accelWindowSize is the number of detent timestamps kept per dial for
+	// velocity estimation. Larger values smooth acceleration more aggressively
+	// and reduce the "last big jump" before stopping.
+	accelWindowSize = 3
 )
 
 var PicoDialController = resource.NewModel("viam", "pico-dial-controller", "pico-dial-controller")
@@ -150,9 +155,9 @@ type picoDialControllerPicoDialController struct {
 	cfg        *Config
 	cancelCtx  context.Context
 	cancelFunc func()
-	myArm         arm.Arm
-	byDial        map[int]DialMapping
-	lastDetentTime map[int]time.Time // per-dial, only accessed from readLoop
+	myArm             arm.Arm
+	byDial            map[int]DialMapping
+	lastDetentTimes   map[int][]time.Time // per-dial ring buffer, only accessed from readLoop
 }
 
 func newPicoDialControllerPicoDialController(ctx context.Context, deps resource.Dependencies, rawConf resource.Config, logger logging.Logger) (resource.Resource, error) {
@@ -183,9 +188,9 @@ func NewPicoDialController(ctx context.Context, deps resource.Dependencies, name
 		cfg:        conf,
 		cancelCtx:  cancelCtx,
 		cancelFunc: cancelFunc,
-		myArm:          myArm,
-		byDial:         byDial,
-		lastDetentTime: make(map[int]time.Time),
+		myArm:           myArm,
+		byDial:          byDial,
+		lastDetentTimes: make(map[int][]time.Time),
 	}
 
 	devs := hid.Enumerate(vendorID, productID)
@@ -250,22 +255,30 @@ func (s *picoDialControllerPicoDialController) readLoop(dev *hid.Device) {
 }
 
 // acceleration returns a movement multiplier based on how fast the dial is turning.
+// Velocity is estimated over a rolling window of accelWindowSize timestamps so that
+// the last detent before stopping is averaged against recent history, preventing a
+// large final jump.
 // Only called from readLoop — no locking needed.
 func (s *picoDialControllerPicoDialController) acceleration(dialIndex int) float64 {
 	now := time.Now()
-	last, ok := s.lastDetentTime[dialIndex]
-	s.lastDetentTime[dialIndex] = now
 
-	if !ok {
-		return 1.0 // first event, no velocity yet
+	times := s.lastDetentTimes[dialIndex]
+	times = append(times, now)
+	if len(times) > accelWindowSize {
+		times = times[len(times)-accelWindowSize:]
+	}
+	s.lastDetentTimes[dialIndex] = times
+
+	if len(times) < 2 {
+		return 1.0 // not enough history yet
 	}
 
-	dt := now.Sub(last).Seconds()
+	dt := times[len(times)-1].Sub(times[0]).Seconds()
 	if dt <= 0 {
 		return s.cfg.accelMaxMultiplier()
 	}
 
-	velocity := 1.0 / dt
+	velocity := float64(len(times)-1) / dt
 	threshold := s.cfg.accelThresholdHz()
 	if velocity <= threshold {
 		return 1.0
