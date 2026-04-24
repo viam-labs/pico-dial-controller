@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"math"
+	"sync"
 	"time"
 
 	"github.com/bearsh/hid"
@@ -20,12 +21,8 @@ const (
 	vendorID  uint16 = 0x2E8A
 	productID uint16 = 0x000A
 
-	defaultMoveMM float64 = 1.0
-
-	// accelWindowSize is the number of detent timestamps kept per dial for
-	// velocity estimation. Larger values smooth acceleration more aggressively
-	// and reduce the "last big jump" before stopping.
-	accelWindowSize = 3
+	defaultMoveMM    float64 = 1.0
+	defaultDrainMs   int     = 20 // 50 Hz
 )
 
 var PicoDialController = resource.NewModel("viam", "pico-dial-controller", "pico-dial-controller")
@@ -41,7 +38,7 @@ func init() {
 // DialMapping maps a physical encoder index to an arm axis.
 type DialMapping struct {
 	Dial int    `json:"dial"`
-	Axis string `json:"axis"` // "x", "y", "z", or "orientation"
+	Axis string `json:"axis"` // "x", "y", "z", "orientation", "rx", "ry", "rz"
 }
 
 // Config holds the module configuration.
@@ -62,32 +59,19 @@ type Config struct {
 	DialMoveRYDeg float64 `json:"dial_move_ry_deg,omitempty"`
 	DialMoveRZDeg float64 `json:"dial_move_rz_deg,omitempty"`
 
-	// Acceleration: movement multiplier grows as dial velocity increases.
-	// multiplier = clamp((velocity / AccelThresholdHz)^AccelExponent, 1, AccelMaxMultiplier)
-	AccelThresholdHz   float64 `json:"accel_threshold_hz,omitempty"`   // detents/sec to start accelerating (default 3)
-	AccelMaxMultiplier float64 `json:"accel_max_multiplier,omitempty"` // max multiplier at high speed (default 10)
-	AccelExponent      float64 `json:"accel_exponent,omitempty"`       // curve shape: 1=linear, 2=quadratic (default 1.5)
+	// DrainIntervalMs controls how often accumulated dial input is flushed to
+	// the arm. Detents that arrive between flushes are summed, so faster
+	// turning produces proportionally larger moves per flush (natural
+	// acceleration). Lower values are more responsive; higher values give
+	// smoother motion. Default: 20ms (50 Hz).
+	DrainIntervalMs int `json:"drain_interval_ms,omitempty"`
 }
 
-func (cfg *Config) accelThresholdHz() float64 {
-	if cfg.AccelThresholdHz > 0 {
-		return cfg.AccelThresholdHz
+func (cfg *Config) drainInterval() time.Duration {
+	if cfg.DrainIntervalMs > 0 {
+		return time.Duration(cfg.DrainIntervalMs) * time.Millisecond
 	}
-	return 3.0
-}
-
-func (cfg *Config) accelMaxMultiplier() float64 {
-	if cfg.AccelMaxMultiplier > 0 {
-		return cfg.AccelMaxMultiplier
-	}
-	return 10.0
-}
-
-func (cfg *Config) accelExponent() float64 {
-	if cfg.AccelExponent > 0 {
-		return cfg.AccelExponent
-	}
-	return 1.5
+	return time.Duration(defaultDrainMs) * time.Millisecond
 }
 
 func (cfg *Config) moveMM(axis string) float64 {
@@ -141,7 +125,7 @@ func (cfg *Config) Validate(path string) ([]string, []string, error) {
 		switch d.Axis {
 		case "x", "y", "z", "orientation", "rx", "ry", "rz":
 		default:
-			return nil, nil, fmt.Errorf("%s: dials[%d] axis %q must be one of: x, y, z, orientation", path, i, d.Axis)
+			return nil, nil, fmt.Errorf("%s: dials[%d] axis %q must be one of: x, y, z, orientation, rx, ry, rz", path, i, d.Axis)
 		}
 	}
 	return []string{cfg.ArmName}, nil, nil
@@ -155,9 +139,11 @@ type picoDialControllerPicoDialController struct {
 	cfg        *Config
 	cancelCtx  context.Context
 	cancelFunc func()
-	myArm             arm.Arm
-	byDial            map[int]DialMapping
-	lastDetentTimes   map[int][]time.Time // per-dial ring buffer, only accessed from readLoop
+	myArm      arm.Arm
+	byDial     map[int]DialMapping
+
+	pendingMu    sync.Mutex
+	pendingMoves map[string]float64 // axis -> accumulated delta (mm or deg)
 }
 
 func newPicoDialControllerPicoDialController(ctx context.Context, deps resource.Dependencies, rawConf resource.Config, logger logging.Logger) (resource.Resource, error) {
@@ -183,14 +169,14 @@ func NewPicoDialController(ctx context.Context, deps resource.Dependencies, name
 	}
 
 	s := &picoDialControllerPicoDialController{
-		name:       name,
-		logger:     logger,
-		cfg:        conf,
-		cancelCtx:  cancelCtx,
-		cancelFunc: cancelFunc,
-		myArm:           myArm,
-		byDial:          byDial,
-		lastDetentTimes: make(map[int][]time.Time),
+		name:         name,
+		logger:       logger,
+		cfg:          conf,
+		cancelCtx:    cancelCtx,
+		cancelFunc:   cancelFunc,
+		myArm:        myArm,
+		byDial:       byDial,
+		pendingMoves: make(map[string]float64),
 	}
 
 	devs := hid.Enumerate(vendorID, productID)
@@ -216,9 +202,12 @@ func NewPicoDialController(ctx context.Context, deps resource.Dependencies, name
 	}
 
 	go s.readLoop(dev)
+	go s.drainLoop()
 	return s, nil
 }
 
+// readLoop reads HID detent events and accumulates them into pendingMoves.
+// It does not call the arm directly — that is drainLoop's job.
 func (s *picoDialControllerPicoDialController) readLoop(dev *hid.Device) {
 	defer dev.Close()
 
@@ -247,88 +236,94 @@ func (s *picoDialControllerPicoDialController) readLoop(dev *hid.Device) {
 			continue
 		}
 
-		multiplier := s.acceleration(dialIndex)
-		if err := s.moveDial(mapping.Axis, direction, multiplier); err != nil {
-			s.logger.Warnw("arm move failed", "axis", mapping.Axis, "error", err)
+		var delta float64
+		switch mapping.Axis {
+		case "rx", "ry", "rz":
+			delta = s.cfg.moveDeg(mapping.Axis) * float64(direction)
+		default:
+			delta = s.cfg.moveMM(mapping.Axis) * float64(direction)
+		}
+
+		s.pendingMu.Lock()
+		s.pendingMoves[mapping.Axis] += delta
+		s.pendingMu.Unlock()
+	}
+}
+
+// drainLoop ticks at drain_interval_ms and sends one arm command per tick
+// containing all accumulated movement since the last tick. When the dial is
+// still, pendingMoves is empty and no arm command is issued.
+func (s *picoDialControllerPicoDialController) drainLoop() {
+	ticker := time.NewTicker(s.cfg.drainInterval())
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-s.cancelCtx.Done():
+			return
+		case <-ticker.C:
+			s.pendingMu.Lock()
+			if len(s.pendingMoves) == 0 {
+				s.pendingMu.Unlock()
+				continue
+			}
+			pending := s.pendingMoves
+			s.pendingMoves = make(map[string]float64)
+			s.pendingMu.Unlock()
+
+			if err := s.flushMoves(pending); err != nil {
+				s.logger.Warnw("arm move failed", "error", err)
+			}
 		}
 	}
 }
 
-// acceleration returns a movement multiplier based on how fast the dial is turning.
-// Velocity is estimated over a rolling window of accelWindowSize timestamps so that
-// the last detent before stopping is averaged against recent history, preventing a
-// large final jump.
-// Only called from readLoop — no locking needed.
-func (s *picoDialControllerPicoDialController) acceleration(dialIndex int) float64 {
-	now := time.Now()
-
-	times := s.lastDetentTimes[dialIndex]
-	times = append(times, now)
-	if len(times) > accelWindowSize {
-		times = times[len(times)-accelWindowSize:]
-	}
-	s.lastDetentTimes[dialIndex] = times
-
-	if len(times) < 2 {
-		return 1.0 // not enough history yet
-	}
-
-	dt := times[len(times)-1].Sub(times[0]).Seconds()
-	if dt <= 0 {
-		return s.cfg.accelMaxMultiplier()
-	}
-
-	velocity := float64(len(times)-1) / dt
-	threshold := s.cfg.accelThresholdHz()
-	if velocity <= threshold {
-		return 1.0
-	}
-
-	multiplier := math.Pow(velocity/threshold, s.cfg.accelExponent())
-	return math.Min(multiplier, s.cfg.accelMaxMultiplier())
-}
-
-func (s *picoDialControllerPicoDialController) moveDial(axis string, direction int, multiplier float64) error {
+// flushMoves applies all accumulated deltas in a single EndPosition /
+// MoveToPosition round-trip. Translation axes are applied to the position
+// vector; rotation axes are composed onto the orientation quaternion.
+func (s *picoDialControllerPicoDialController) flushMoves(pending map[string]float64) error {
 	currentPose, err := s.myArm.EndPosition(s.cancelCtx, nil)
 	if err != nil {
 		return fmt.Errorf("failed to get arm position: %w", err)
 	}
 
-	switch axis {
-	case "rx", "ry", "rz":
-		deg := s.cfg.moveDeg(axis) * float64(direction) * multiplier
-		newPose, err := rotatePose(currentPose, axis, deg)
+	pt := currentPose.Point()
+	ori := currentPose.Orientation()
+
+	// Apply translation deltas first.
+	for axis, delta := range pending {
+		switch axis {
+		case "x":
+			pt.X += delta
+		case "y":
+			pt.Y += delta
+		case "z":
+			pt.Z += delta
+		case "orientation":
+			ov := ori.OrientationVectorRadians()
+			pt = r3.Vector{
+				X: pt.X + ov.OX*delta,
+				Y: pt.Y + ov.OY*delta,
+				Z: pt.Z + ov.OZ*delta,
+			}
+		}
+	}
+
+	// Apply rotation deltas, updating orientation incrementally.
+	for _, axis := range []string{"rx", "ry", "rz"} {
+		delta, ok := pending[axis]
+		if !ok {
+			continue
+		}
+		newPose, err := rotatePose(spatialmath.NewPose(pt, ori), axis, delta)
 		if err != nil {
 			return err
 		}
-		return s.myArm.MoveToPosition(s.cancelCtx, newPose, nil)
+		pt = newPose.Point()
+		ori = newPose.Orientation()
 	}
 
-	mm := s.cfg.moveMM(axis) * float64(direction) * multiplier
-	pt := currentPose.Point()
-	var newPoint r3.Vector
-
-	switch axis {
-	case "x":
-		newPoint = r3.Vector{X: pt.X + mm, Y: pt.Y, Z: pt.Z}
-	case "y":
-		newPoint = r3.Vector{X: pt.X, Y: pt.Y + mm, Z: pt.Z}
-	case "z":
-		newPoint = r3.Vector{X: pt.X, Y: pt.Y, Z: pt.Z + mm}
-	case "orientation":
-		// Move along the tool's current orientation vector
-		ov := currentPose.Orientation().OrientationVectorRadians()
-		newPoint = r3.Vector{
-			X: pt.X + ov.OX*mm,
-			Y: pt.Y + ov.OY*mm,
-			Z: pt.Z + ov.OZ*mm,
-		}
-	default:
-		return fmt.Errorf("unknown axis %q", axis)
-	}
-
-	newPose := spatialmath.NewPose(newPoint, currentPose.Orientation())
-	return s.myArm.MoveToPosition(s.cancelCtx, newPose, nil)
+	return s.myArm.MoveToPosition(s.cancelCtx, spatialmath.NewPose(pt, ori), nil)
 }
 
 // rotatePose applies a rotation of deg degrees around the given world axis (rx/ry/rz)
