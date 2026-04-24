@@ -66,13 +66,12 @@ type Config struct {
 	// smoother motion. Default: 20ms (50 Hz).
 	DrainIntervalMs int `json:"drain_interval_ms,omitempty"`
 
-	// Acceleration: movement multiplier grows as dial velocity increases.
-	// multiplier = clamp((detents_per_sec / AccelThresholdHz)^AccelExponent, 1, AccelMaxMultiplier)
-	// Velocity is measured per flush window, so the multiplier reflects the
-	// current batch only — the arm stops as soon as no detents arrive.
-	AccelThresholdHz   float64 `json:"accel_threshold_hz,omitempty"`   // detents/sec to start accelerating (default 3)
-	AccelMaxMultiplier float64 `json:"accel_max_multiplier,omitempty"` // max multiplier at high speed (default 10)
-	AccelExponent      float64 `json:"accel_exponent,omitempty"`       // curve shape: 1=linear, 2=quadratic (default 1.5)
+	// Acceleration: movement multiplier grows as more detents arrive per flush window.
+	// multiplier = clamp((count / AccelThresholdCount)^AccelExponent, 1, AccelMaxMultiplier)
+	// Single detents (fine control) stay at 1× until count exceeds the threshold.
+	AccelThresholdCount float64 `json:"accel_threshold_count,omitempty"` // detents/window to start accelerating (default 2)
+	AccelMaxMultiplier  float64 `json:"accel_max_multiplier,omitempty"`  // max multiplier at high speed (default 10)
+	AccelExponent       float64 `json:"accel_exponent,omitempty"`        // curve shape: 1=linear, 2=quadratic (default 1.5)
 }
 
 func (cfg *Config) drainInterval() time.Duration {
@@ -82,11 +81,11 @@ func (cfg *Config) drainInterval() time.Duration {
 	return time.Duration(defaultDrainMs) * time.Millisecond
 }
 
-func (cfg *Config) accelThresholdHz() float64 {
-	if cfg.AccelThresholdHz > 0 {
-		return cfg.AccelThresholdHz
+func (cfg *Config) accelThresholdCount() float64 {
+	if cfg.AccelThresholdCount > 0 {
+		return cfg.AccelThresholdCount
 	}
-	return 3.0
+	return 2.0
 }
 
 func (cfg *Config) accelMaxMultiplier() float64 {
@@ -316,12 +315,11 @@ func (s *picoDialControllerPicoDialController) drainLoop() {
 // within one drain window. Velocity is counts/drain_interval_seconds, giving a
 // per-batch multiplier that goes to zero as soon as no detents arrive.
 func (s *picoDialControllerPicoDialController) accelMultiplier(count int) float64 {
-	speed := float64(count) / s.cfg.drainInterval().Seconds()
-	threshold := s.cfg.accelThresholdHz()
-	if speed <= threshold {
+	threshold := s.cfg.accelThresholdCount()
+	if float64(count) <= threshold {
 		return 1.0
 	}
-	multiplier := math.Pow(speed/threshold, s.cfg.accelExponent())
+	multiplier := math.Pow(float64(count)/threshold, s.cfg.accelExponent())
 	return math.Min(multiplier, s.cfg.accelMaxMultiplier())
 }
 
