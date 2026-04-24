@@ -65,6 +65,14 @@ type Config struct {
 	// acceleration). Lower values are more responsive; higher values give
 	// smoother motion. Default: 20ms (50 Hz).
 	DrainIntervalMs int `json:"drain_interval_ms,omitempty"`
+
+	// Acceleration: movement multiplier grows as dial velocity increases.
+	// multiplier = clamp((detents_per_sec / AccelThresholdHz)^AccelExponent, 1, AccelMaxMultiplier)
+	// Velocity is measured per flush window, so the multiplier reflects the
+	// current batch only — the arm stops as soon as no detents arrive.
+	AccelThresholdHz   float64 `json:"accel_threshold_hz,omitempty"`   // detents/sec to start accelerating (default 3)
+	AccelMaxMultiplier float64 `json:"accel_max_multiplier,omitempty"` // max multiplier at high speed (default 10)
+	AccelExponent      float64 `json:"accel_exponent,omitempty"`       // curve shape: 1=linear, 2=quadratic (default 1.5)
 }
 
 func (cfg *Config) drainInterval() time.Duration {
@@ -72,6 +80,27 @@ func (cfg *Config) drainInterval() time.Duration {
 		return time.Duration(cfg.DrainIntervalMs) * time.Millisecond
 	}
 	return time.Duration(defaultDrainMs) * time.Millisecond
+}
+
+func (cfg *Config) accelThresholdHz() float64 {
+	if cfg.AccelThresholdHz > 0 {
+		return cfg.AccelThresholdHz
+	}
+	return 3.0
+}
+
+func (cfg *Config) accelMaxMultiplier() float64 {
+	if cfg.AccelMaxMultiplier > 0 {
+		return cfg.AccelMaxMultiplier
+	}
+	return 10.0
+}
+
+func (cfg *Config) accelExponent() float64 {
+	if cfg.AccelExponent > 0 {
+		return cfg.AccelExponent
+	}
+	return 1.5
 }
 
 func (cfg *Config) moveMM(axis string) float64 {
@@ -142,8 +171,9 @@ type picoDialControllerPicoDialController struct {
 	myArm      arm.Arm
 	byDial     map[int]DialMapping
 
-	pendingMu    sync.Mutex
-	pendingMoves map[string]float64 // axis -> accumulated delta (mm or deg)
+	pendingMu     sync.Mutex
+	pendingMoves  map[string]float64 // axis -> accumulated delta (mm or deg)
+	pendingCounts map[string]int     // axis -> detent count this window (for acceleration)
 }
 
 func newPicoDialControllerPicoDialController(ctx context.Context, deps resource.Dependencies, rawConf resource.Config, logger logging.Logger) (resource.Resource, error) {
@@ -176,7 +206,8 @@ func NewPicoDialController(ctx context.Context, deps resource.Dependencies, name
 		cancelFunc:   cancelFunc,
 		myArm:        myArm,
 		byDial:       byDial,
-		pendingMoves: make(map[string]float64),
+		pendingMoves:  make(map[string]float64),
+		pendingCounts: make(map[string]int),
 	}
 
 	devs := hid.Enumerate(vendorID, productID)
@@ -246,6 +277,7 @@ func (s *picoDialControllerPicoDialController) readLoop(dev *hid.Device) {
 
 		s.pendingMu.Lock()
 		s.pendingMoves[mapping.Axis] += delta
+		s.pendingCounts[mapping.Axis]++
 		s.pendingMu.Unlock()
 	}
 }
@@ -268,20 +300,36 @@ func (s *picoDialControllerPicoDialController) drainLoop() {
 				continue
 			}
 			pending := s.pendingMoves
+			counts := s.pendingCounts
 			s.pendingMoves = make(map[string]float64)
+			s.pendingCounts = make(map[string]int)
 			s.pendingMu.Unlock()
 
-			if err := s.flushMoves(pending); err != nil {
+			if err := s.flushMoves(pending, counts); err != nil {
 				s.logger.Warnw("arm move failed", "error", err)
 			}
 		}
 	}
 }
 
+// accelMultiplier returns the movement multiplier for a given detent count
+// within one drain window. Velocity is counts/drain_interval_seconds, giving a
+// per-batch multiplier that goes to zero as soon as no detents arrive.
+func (s *picoDialControllerPicoDialController) accelMultiplier(count int) float64 {
+	speed := float64(count) / s.cfg.drainInterval().Seconds()
+	threshold := s.cfg.accelThresholdHz()
+	if speed <= threshold {
+		return 1.0
+	}
+	multiplier := math.Pow(speed/threshold, s.cfg.accelExponent())
+	return math.Min(multiplier, s.cfg.accelMaxMultiplier())
+}
+
 // flushMoves applies all accumulated deltas in a single EndPosition /
 // MoveToPosition round-trip. Translation axes are applied to the position
 // vector; rotation axes are composed onto the orientation quaternion.
-func (s *picoDialControllerPicoDialController) flushMoves(pending map[string]float64) error {
+// An acceleration multiplier is derived from the detent count per axis.
+func (s *picoDialControllerPicoDialController) flushMoves(pending map[string]float64, counts map[string]int) error {
 	currentPose, err := s.myArm.EndPosition(s.cancelCtx, nil)
 	if err != nil {
 		return fmt.Errorf("failed to get arm position: %w", err)
@@ -292,6 +340,7 @@ func (s *picoDialControllerPicoDialController) flushMoves(pending map[string]flo
 
 	// Apply translation deltas first.
 	for axis, delta := range pending {
+		delta *= s.accelMultiplier(counts[axis])
 		switch axis {
 		case "x":
 			pt.X += delta
@@ -315,6 +364,7 @@ func (s *picoDialControllerPicoDialController) flushMoves(pending map[string]flo
 		if !ok {
 			continue
 		}
+		delta *= s.accelMultiplier(counts[axis])
 		newPose, err := rotatePose(spatialmath.NewPose(pt, ori), axis, delta)
 		if err != nil {
 			return err
