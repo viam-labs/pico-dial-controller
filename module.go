@@ -21,8 +21,8 @@ const (
 	vendorID  uint16 = 0x2E8A
 	productID uint16 = 0x000A
 
-	defaultMoveMM    float64 = 1.0
-	defaultDrainMs   int     = 20 // 50 Hz
+	defaultMoveMM  float64 = 1.0
+	defaultDrainMs int     = 20 // 50 Hz
 )
 
 var PicoDialController = resource.NewModel("viam", "pico-dial-controller", "pico-dial-controller")
@@ -198,13 +198,13 @@ func NewPicoDialController(ctx context.Context, deps resource.Dependencies, name
 	}
 
 	s := &picoDialControllerPicoDialController{
-		name:         name,
-		logger:       logger,
-		cfg:          conf,
-		cancelCtx:    cancelCtx,
-		cancelFunc:   cancelFunc,
-		myArm:        myArm,
-		byDial:       byDial,
+		name:          name,
+		logger:        logger,
+		cfg:           conf,
+		cancelCtx:     cancelCtx,
+		cancelFunc:    cancelFunc,
+		myArm:         myArm,
+		byDial:        byDial,
 		pendingMoves:  make(map[string]float64),
 		pendingCounts: make(map[string]int),
 	}
