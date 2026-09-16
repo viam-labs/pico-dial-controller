@@ -1,13 +1,13 @@
 package main
 
 import (
-	"picodialcontroller"
+	generic "go.viam.com/rdk/components/generic"
 	"go.viam.com/rdk/module"
 	"go.viam.com/rdk/resource"
-	generic "go.viam.com/rdk/components/generic"
+	"picodialcontroller"
 )
 
 func main() {
 	// ModularMain can take multiple APIModel arguments, if your module implements multiple models.
-	module.ModularMain(resource.APIModel{ generic.API, picodialcontroller.PicoDialController})
+	module.ModularMain(resource.APIModel{generic.API, picodialcontroller.PicoDialController})
 }

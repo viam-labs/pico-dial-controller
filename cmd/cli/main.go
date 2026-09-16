@@ -2,10 +2,10 @@ package main
 
 import (
 	"context"
-	"picodialcontroller"
+	generic "go.viam.com/rdk/components/generic"
 	"go.viam.com/rdk/logging"
 	"go.viam.com/rdk/resource"
-	generic "go.viam.com/rdk/components/generic"
+	"picodialcontroller"
 )
 
 func main() {
