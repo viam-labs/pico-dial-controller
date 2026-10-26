@@ -186,7 +186,7 @@ func newPicoDialControllerPicoDialController(ctx context.Context, deps resource.
 func NewPicoDialController(ctx context.Context, deps resource.Dependencies, name resource.Name, conf *Config, logger logging.Logger) (resource.Resource, error) {
 	cancelCtx, cancelFunc := context.WithCancel(context.Background())
 
-	myArm, err := arm.FromDependencies(deps, conf.ArmName)
+	myArm, err := arm.FromProvider(deps, conf.ArmName)
 	if err != nil {
 		cancelFunc()
 		return nil, fmt.Errorf("arm %q not found: %w", conf.ArmName, err)
@@ -239,7 +239,7 @@ func NewPicoDialController(ctx context.Context, deps resource.Dependencies, name
 // readLoop reads HID detent events and accumulates them into pendingMoves.
 // It does not call the arm directly — that is drainLoop's job.
 func (s *picoDialControllerPicoDialController) readLoop(dev *hid.Device) {
-	defer dev.Close()
+	defer func() { _ = dev.Close() }()
 
 	buf := make([]byte, 64)
 	for {
